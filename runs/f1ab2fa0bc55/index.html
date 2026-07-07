@@ -73,8 +73,6 @@ h1{font-size:30px;line-height:1.05;margin:4px 0 2px}
   position:fixed;right:12px;bottom:calc(22px + env(safe-area-inset-bottom));z-index:6;display:none;
   background:var(--accent);color:#fff;border:none;border-radius:999px;padding:10px 16px;font-weight:800;font-size:13px;
 }
-#theme-btn{position:fixed;left:12px;bottom:calc(22px + env(safe-area-inset-bottom));z-index:6;
-  background:var(--panel);color:var(--muted);border:1px solid var(--border);border-radius:999px;padding:10px 14px;font-weight:700;font-size:13px}
 #nav-btn{position:fixed;right:12px;top:calc(12px + env(safe-area-inset-top));z-index:9;
   background:var(--panel);color:var(--ink);border:1px solid var(--cyan);border-radius:999px;padding:10px 16px;font-weight:800;font-size:13px}
 .tag{font-size:11px;color:var(--muted)}
@@ -89,7 +87,8 @@ h1{font-size:30px;line-height:1.05;margin:4px 0 2px}
 #map{position:absolute;inset:0;width:100%;height:100%;touch-action:none}
 #prof{flex:1 1 0;min-height:0;width:100%;border-top:1px solid var(--border)}
 .pacepill{position:absolute;left:8px;background:color-mix(in srgb,var(--bg) 78%,transparent);
-  border:1px solid var(--border);border-radius:10px;padding:6px 10px;font-size:11px;color:var(--muted);z-index:2}
+  border:1px solid var(--border);border-radius:10px;padding:6px 10px;font-size:11px;color:var(--muted);z-index:2;
+  cursor:pointer;user-select:none;-webkit-user-select:none}
 .pacepill b{display:inline-block;font-size:19px;color:var(--ink);font-variant-numeric:tabular-nums;line-height:1.1;margin-right:4px}
 .pacepill .u{font-size:10px;color:var(--muted)}
 .pacepill .l{display:block}
@@ -106,7 +105,6 @@ h1{font-size:30px;line-height:1.05;margin:4px 0 2px}
 <main id="deck"></main>
 <div class="dots" id="dots"></div>
 <button id="live-btn">⦿ LIVE</button>
-<button id="theme-btn">AUTO</button>
 <button id="nav-btn">🧭 NAV</button>
 <div id="nav">
   <div id="mapwrap">
@@ -266,7 +264,7 @@ function project(lat,lng){
 function onFix(pos){
   fix=pos;const p=project(pos.coords.latitude,pos.coords.longitude);
   if(p){offM=p.offM; along=p.alongM/Math.max(1,R.total)*totalKm;}
-  trackLegPace();
+  trackPaceMarks();
   render();
   navNeedsDraw=true;
 }
@@ -288,21 +286,45 @@ function raceState(){
   if(next<0)next=stations.length-1;
   return{kind:'in_leg',from:stations[Math.max(0,next-1)],to:stations[next],index:next,along};
 }
-/* Actual pace inside the current leg (from the km/time where we entered it). */
-function trackLegPace(){
-  const st=raceState();
-  if(st.kind!=='in_leg'){if(st.kind==='at_as')store.legMark=null;save();return;}
-  const mark=store.legMark;
-  if(!mark||mark.index!==st.index||along<mark.alongKm-0.2){
-    store.legMark={index:st.index,alongKm:along,t:Date.now()};save();
+/* Actual pace marks: where/when we entered the current leg and the current
+   split, so LEG PACE and SPLIT PACE measure real progress inside each. */
+function currentSplitIndex(){
+  if(along==null)return -1;
+  for(let i=0;i<splits.length;i++){
+    if(along>=splits[i].startDistanceKm&&(along<splits[i].endDistanceKm||i===splits.length-1))return i;
   }
+  return -1;
 }
-function currentLegPaceSec(){
-  const mark=store.legMark;
+function trackPaceMarks(){
+  const st=raceState();
+  if(st.kind==='in_leg'){
+    const mark=store.legMark;
+    if(!mark||mark.index!==st.index||along<mark.alongKm-0.2){
+      store.legMark={index:st.index,alongKm:along,t:Date.now()};
+    }
+  }else if(st.kind==='at_as'){store.legMark=null;}
+  const si=currentSplitIndex();
+  if(si>=0){
+    const sm=store.splitMark;
+    if(!sm||sm.index!==si||along<sm.alongKm-0.2){
+      store.splitMark={index:si,alongKm:along,t:Date.now()};
+    }
+  }
+  save();
+}
+function paceFromMark(mark,minKm){
   if(!mark||along==null)return null;
   const dKm=along-mark.alongKm;
-  if(dKm<0.12)return null;
+  if(dKm<minKm)return null;
   return ((Date.now()-mark.t)/1000)/dKm;
+}
+function currentLegPaceSec(){return paceFromMark(store.legMark,0.12);}
+function currentSplitPaceSec(){return paceFromMark(store.splitMark,0.08);}
+function routePaceSec(){
+  const s0=startEpoch();
+  if(!s0||along==null||along<0.15)return null;
+  const elapsed=(Date.now()-s0)/1000;
+  return elapsed>10?elapsed/along:null;
 }
 
 /* ---------- cards ---------- */
@@ -692,16 +714,47 @@ function drawProfile(){
   profCtx.fillStyle=day?'#101413':'#f2f7f8';
   profCtx.fillText(label,w-Rm-tw-7*DPR,T+12.5*DPR);
 }
+/* Pace pills cycle through scopes on tap: LEG → ROUTE → SPLIT → LEG … */
+const PACE_SCOPES=['leg','route','split'];
+let paceScope=PACE_SCOPES.includes(store.paceScope)?store.paceScope:'leg';
+function cyclePaceScope(){
+  paceScope=PACE_SCOPES[(PACE_SCOPES.indexOf(paceScope)+1)%PACE_SCOPES.length];
+  store.paceScope=paceScope;save();
+  updatePacePills();
+}
+document.getElementById('pp-cur').onclick=cyclePaceScope;
+document.getElementById('pp-tgt').onclick=cyclePaceScope;
 function updatePacePills(){
   const st=raceState();
-  const cur=currentLegPaceSec();
+  let curLabel,tgtLabel,cur=null,tgt=null;
+  if(paceScope==='route'){
+    curLabel='ROUTE PACE';tgtLabel='GOAL PACE';
+    cur=routePaceSec();
+    tgt=totalKm>0?targetSecAtKm(totalKm)/totalKm:null;
+  }else if(paceScope==='split'){
+    curLabel='SPLIT PACE';tgtLabel='SPLIT TARGET';
+    cur=currentSplitPaceSec();
+    const si=currentSplitIndex();
+    if(si>=0)tgt=splits[si].targetTimeSec/Math.max(.001,splits[si].distanceKm);
+    else if(splits.length)tgt=paceAtKm(0.01);
+  }else{
+    curLabel='LEG PACE';tgtLabel='LEG TARGET';
+    cur=currentLegPaceSec();
+    if(st.kind==='in_leg'){
+      const legKm=Math.max(.001,st.to.distance-st.from.distance);
+      tgt=(targetSecAtKm(st.to.distance)-targetSecAtKm(st.from.distance))/legKm;
+    }else if(st.kind==='at_as'){
+      const next=stations[Math.min(st.index+1,stations.length-1)];
+      const legKm=Math.max(.001,next.distance-st.station.distance);
+      tgt=(targetSecAtKm(next.distance)-targetSecAtKm(st.station.distance))/legKm;
+    }else if(splits.length){
+      const first=stations.length>1?stations[1].distance:totalKm;
+      tgt=targetSecAtKm(first)/Math.max(.001,first);
+    }
+  }
+  document.querySelector('#pp-cur .l').textContent=curLabel;
+  document.querySelector('#pp-tgt .l').textContent=tgtLabel;
   document.querySelector('#pp-cur b').textContent=cur?fmtPaceSec(cur):'--:--';
-  let tgt=null;
-  if(st.kind==='in_leg'){
-    const legKm=Math.max(.001,st.to.distance-st.from.distance);
-    tgt=(targetSecAtKm(st.to.distance)-targetSecAtKm(st.from.distance))/legKm;
-  }else if(along!=null){tgt=paceAtKm(Math.min(along,totalKm-.01));}
-  else if(splits.length){tgt=paceAtKm(0.01);}
   document.querySelector('#pp-tgt b').textContent=tgt?fmtPaceSec(tgt):'--:--';
 }
 function navLoop(){
@@ -736,9 +789,12 @@ mapCv.addEventListener('pointermove',e=>{
     ptrs.set(e.pointerId,now);
     const tz=Math.max(TZ_MIN,Math.min(TZ_MAX,Math.round(mapZoom)));
     const scale=Math.pow(2,mapZoom-tz)*DPR;
-    const rot=rotation*Math.PI/180;
-    const wx=(-dx*Math.cos(rot)-dy*Math.sin(rot))/scale;
-    const wy=(dx*Math.sin(rot)-dy*Math.cos(rot))/scale;
+    // Inverse of the draw transform (translate·rotate(-rotation)·scale):
+    // the content must follow the finger, so the center moves by
+    // -R(+rotation)·(dx,dy)/scale in world coordinates.
+    const th=rotation*Math.PI/180;
+    const wx=-(dx*Math.cos(th)-dy*Math.sin(th))/scale;
+    const wy=-(dx*Math.sin(th)+dy*Math.cos(th))/scale;
     const c=mapCenter();
     const wc=mercWorld(c.lng,c.lat,tz);
     const nx=wc.x+wx, ny=wc.y+wy;
@@ -817,16 +873,11 @@ function setNav(on){
 navBtn.onclick=()=>setNav(!navOn);
 window.addEventListener('resize',()=>{if(navOn)resizeCanvases();});
 
-/* ---------- day / night ---------- */
-let themeMode=store.theme||'auto';
-const themeBtn=document.getElementById('theme-btn');
+/* ---------- day / night: automatic by local hour (no button) ---------- */
 function applyTheme(){
   const hr=new Date().getHours();
-  const day=themeMode==='day'||(themeMode==='auto'&&hr>=7&&hr<19);
-  document.documentElement.classList.toggle('day',day);
-  themeBtn.textContent=themeMode.toUpperCase();
+  document.documentElement.classList.toggle('day',hr>=7&&hr<19);
 }
-themeBtn.onclick=()=>{themeMode=themeMode==='auto'?'day':(themeMode==='day'?'night':'auto');store.theme=themeMode;save();applyTheme();};
 
 /* ---------- boot ---------- */
 applyTheme();render();startGps();
