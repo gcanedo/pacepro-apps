@@ -25,6 +25,8 @@ body{
   background:var(--bg);color:var(--ink);
   font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
   overflow:hidden;
+  /* race app: no text selection / iOS callout bubbles on any control */
+  user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;
 }
 /* ---------- MAP: the default, full-screen view ---------- */
 #map{position:fixed;inset:0;width:100%;height:100%;touch-action:none;background:#0a1216}
@@ -40,6 +42,12 @@ body{
   text-overflow:ellipsis;box-shadow:0 2px 8px rgba(0,0,0,.3)}
 #tile-status{position:fixed;left:10px;bottom:322px;z-index:7;font-size:10px;color:#cdd6dc;
   background:rgba(13,17,20,.7);padding:2px 7px;border-radius:8px}
+#breakchip{position:fixed;left:50%;transform:translateX(-50%);z-index:30;display:none;
+  top:calc(14px + env(safe-area-inset-top,0px));
+  background:rgba(13,15,18,.94);color:var(--amber);border:1px solid rgba(255,179,31,.55);
+  border-radius:999px;padding:8px 16px;font-weight:800;font-size:16px;
+  font-variant-numeric:tabular-nums;box-shadow:0 2px 10px rgba(0,0,0,.4);white-space:nowrap}
+#breakchip.over{color:#fff;background:#c62828;border-color:#e57373}
 #panel{position:fixed;left:0;right:0;bottom:0;z-index:6;background:#0d0f12;
   border-radius:18px 18px 0 0;padding:0 10px calc(10px + env(safe-area-inset-bottom,0px));
   box-shadow:0 -4px 18px rgba(0,0,0,.45)}
@@ -110,8 +118,9 @@ h1{font-size:30px;line-height:1.05;margin:4px 0 2px}
 <body>
 <canvas id="map"></canvas>
 <button id="cards-btn" class="cbtn" aria-label="Cards">▾</button>
-<button id="center-btn" class="cbtn" aria-label="Center">◎</button>
+<button id="center-btn" class="cbtn" aria-label="Orientation">▲</button>
 <div id="legpill">—</div>
+<div id="breakchip"></div>
 <div id="tile-status"></div>
 <div id="panel">
   <canvas id="prof"></canvas>
@@ -201,6 +210,13 @@ function paceAtKm(km){for(const s of splits){if(km>=s.startDistanceKm&&km<s.endD
 function effortColorAtKm(km){for(const s of splits){if(km>=s.startDistanceKm&&km<s.endDistanceKm)return EFFORT_COLORS[s.effort]||'#ff6a1a';}
   return '#ff6a1a';}
 const totalKm=stations.length?stations[stations.length-1].distance:(R.total/1000);
+/* Loop course: first and last route coordinates within 50 m. The finish
+   marker overlaps the start one, so it stays hidden until the race starts. */
+const IS_LOOP=(()=>{if(R.lat.length<2)return false;
+  const c0=Math.cos(R.lat[0]*Math.PI/180);
+  const dx=(R.lng[R.lng.length-1]-R.lng[0])*111320*c0;
+  const dy=(R.lat[R.lat.length-1]-R.lat[0])*110540;
+  return Math.hypot(dx,dy)<50;})();
 function kmToRouteM(km){return km/Math.max(.001,totalKm)*R.total;}
 function routeIndexAtM(m){let lo=0,hi=R.cum.length-1;while(lo<hi){const mid=(lo+hi)>>1;R.cum[mid]<m?lo=mid+1:hi=mid;}return Math.max(1,lo);}
 function latLngAtKm(km){
@@ -255,6 +271,8 @@ function fmtPaceSec(secPerKm){if(!isFinite(secPerKm)||secPerKm<=0)return '--:--'
    since the last fix (screen-off gaps) and the global result only wins when
    the windowed one is clearly wrong. */
 let fix=null, along=null, offM=null, watchId=null, lastProj=null;
+let startDistM=null;            // straight-line meters to the route's first coordinate
+let wwMaxM=null, wrongWay=false; // wrong-way: sustained retreat from the furthest along
 const CONT_BASE_M=2000, CONT_GROW_MPS=4, CONT_MAX_AGE_S=900;
 /* Invert targetSecAtKm: km the PLAN expects after `sec` seconds of racing. */
 function planKmAtSec(sec){
@@ -307,17 +325,33 @@ function project(lat,lng){
     if(d2<gD2){gD2=d2;gAlong=alongM;}
     if(hasWin&&alongM>=winLo&&alongM<=winHi&&d2<wD2){wD2=d2;wAlong=alongM;}
   }
-  let d2=gD2,alongM=gAlong;
+  let alongM=gAlong;
   if(hasWin&&wD2<Infinity){
     const dW=Math.sqrt(wD2),dG=Math.sqrt(gD2);
-    if(dW<=OFF_ROUTE_M||dW<=dG*2.5){d2=wD2;alongM=wAlong;}
+    if(dW<=OFF_ROUTE_M||dW<=dG*2.5)alongM=wAlong;
   }
   lastProj={alongM,t:now};
-  return {alongM, offM:Math.sqrt(d2)};
+  // offM is the TRUE perpendicular distance to the nearest point of the whole
+  // route (global) — the continuity window only decides the along position.
+  return {alongM, offM:Math.sqrt(gD2)};
+}
+function trackWrongWay(aM){
+  if(clockState()!=='running'){wwMaxM=null;wrongWay=false;return;}
+  if(wwMaxM==null||aM>wwMaxM)wwMaxM=aM;
+  const spd=fix&&fix.coords?fix.coords.speed:null;
+  // >30 m behind the furthest point reached, while actually moving: the DTD
+  // keeps growing on an out-and-back return, so only a real turnaround trips.
+  wrongWay=(wwMaxM-aM)>30&&(spd==null||spd>0.4);
 }
 function onFix(pos){
   fix=pos;const p=project(pos.coords.latitude,pos.coords.longitude);
-  if(p){offM=p.offM; along=p.alongM/Math.max(1,R.total)*totalKm;}
+  if(p){offM=p.offM; along=p.alongM/Math.max(1,R.total)*totalKm; trackWrongWay(p.alongM);}
+  if(R.lat.length){
+    const c0=Math.cos(R.lat[0]*Math.PI/180);
+    startDistM=Math.hypot(
+      (R.lng[0]-pos.coords.longitude)*111320*c0,
+      (R.lat[0]-pos.coords.latitude)*110540);
+  }
   trackPaceMarks();
   render();
   navNeedsDraw=true;
@@ -325,7 +359,10 @@ function onFix(pos){
 function startGps(){if(watchId!=null||!('geolocation'in navigator))return;
   watchId=navigator.geolocation.watchPosition(onFix,()=>{render();},{enableHighAccuracy:true,maximumAge:3000,timeout:20000});}
 function stopGps(){if(watchId!=null){navigator.geolocation.clearWatch(watchId);watchId=null;}}
-document.addEventListener('visibilitychange',()=>{document.hidden?stopGps():startGps();});
+document.addEventListener('visibilitychange',()=>{
+  document.hidden?stopGps():startGps();
+  syncWakeLock(); // wake locks auto-release on hide; re-acquire on return
+});
 
 /* ---------- race state ---------- */
 function raceState(){
@@ -455,7 +492,8 @@ function stationCard(st,i){
     '<div class="metrics">'+
       '<div class="metric"><div class="k">Cutoff</div><div class="v small">'+(st.cutoffTime?esc(st.cutoffTime):'—')+'</div>'+
         '<div class="tag cutleft" data-si="'+i+'"></div></div>'+
-      '<div class="metric"><div class="k">Planned break</div><div class="v small">'+(st.breakTimeMinutes?st.breakTimeMinutes+' min':'—')+'</div></div>'+
+      '<div class="metric"><div class="k">Planned break</div><div class="v small">'+(st.breakTimeMinutes?st.breakTimeMinutes+' min':'—')+'</div>'+
+        '<div class="tag breakleft" data-si="'+i+'"></div></div>'+
     '</div>'+
     '<div class="panelbox">'+
       '<div class="row"><span class="k">Crew here</span><span>'+(st.crewAllowed?(crew.length?'':'allowed'):'no')+'</span></div>'+
@@ -547,6 +585,13 @@ function renderCards(){
     elm.textContent=left>0?('closes in '+fmtHMS(left)):'CLOSED';
     elm.style.color=left<1800?'var(--bad)':'var(--muted)';
   });
+  document.querySelectorAll('.breakleft').forEach(elm=>{
+    const st=stations[+elm.dataset.si];
+    if(!st||!store.asArrival||store.asArrival.id!==st.id){elm.textContent='';return;}
+    const left=(st.breakTimeMinutes||0)*60-(now-store.asArrival.t)/1000;
+    elm.textContent=left>=0?('break left '+fmtHMS(left)):('overtime +'+fmtHMS(-left)+' — GO');
+    elm.style.color=left<60?'var(--bad)':'var(--amber)';
+  });
   if(along!=null){
     [...deck.children].forEach(c=>{
       const km=parseFloat(c.dataset&&c.dataset.km);
@@ -565,7 +610,12 @@ const TILESET=new Set(TILE_KEYS);
 const TILE_Z=[...new Set(TILE_KEYS.map(k=>+k.split('/')[0]))].sort((a,b)=>a-b);
 const TZ_MIN=TILE_Z.length?TILE_Z[0]:12, TZ_MAX=TILE_Z.length?TILE_Z[TILE_Z.length-1]:15;
 let mapZoom=Math.min(TZ_MAX,14.6);
-let headingDeg=null;            // rotates the MARKER only — map is north-up
+let headingDeg=null;
+/* Two nav orientations, toggled by the top-right button:
+   'heading' (default) — the map/route rotate so the runner's nose points up;
+   'north'             — map fixed north-up, the marker arrow rotates. */
+let navMode=store.navMode==='north'?'north':'heading';
+let rotation=0, rotTarget=0;
 let panCenter=null, panUntil=0;
 const tileImgs=new Map();
 
@@ -622,7 +672,12 @@ function drawMap(){
   // most of the visible area (panel excluded).
   const panelPx=(panelEl.offsetHeight||0)*DPR;
   const cx=w/2, cy=Math.max(90*DPR,(h-panelPx)-100*DPR);
-  const rot=0; // north-up, fixed — the marker arrow shows heading instead
+  // Heading-up: rotate the world so the runner faces up. North mode unwinds
+  // smoothly back to 0. Shortest-arc smoothing either way.
+  const want=navMode==='heading'?rotTarget:0;
+  let dR=((want-rotation+540)%360)-180;
+  rotation=(rotation+dR*0.18+360)%360;
+  const rot=-rotation*Math.PI/180;
 
   mapCtx.save();
   mapCtx.translate(cx,cy);
@@ -677,11 +732,11 @@ function drawMap(){
   };
   const fpx=13*DPR;
   mapCtx.font='700 '+(11*DPR)+'px system-ui';
-  // split boundaries: split number in a rounded rectangle (Waze shield style);
-  // boundaries that coincide with a station keep only the AS marker.
+  // split number in a rounded rectangle (Waze shield style) at the MIDDLE of
+  // each split; interior boundaries get a small white dot with black border
+  // so same-color neighbours stay distinguishable.
   for(let i=0;i<splits.length;i++){
-    const km=splits[i].startDistanceKm;
-    if(stations.some(st=>Math.abs(st.distance-km)<0.03))continue;
+    const km=(splits[i].startDistanceKm+splits[i].endDistanceKm)/2;
     const p=latLngAtKm(km);if(!p)continue;
     const s=toScreen(p.lat,p.lng);
     if(s.x<-30||s.y<-30||s.x>w+30||s.y>h+30)continue;
@@ -696,7 +751,20 @@ function drawMap(){
     mapCtx.fillStyle='#111';
     mapCtx.fillText(txt,s.x-tw/2,s.y+4*DPR);
   }
+  for(let i=1;i<splits.length;i++){
+    const km=splits[i].startDistanceKm;
+    if(stations.some(st=>Math.abs(st.distance-km)<0.03))continue;
+    const p=latLngAtKm(km);if(!p)continue;
+    const s=toScreen(p.lat,p.lng);
+    if(s.x<-20||s.y<-20||s.x>w+20||s.y>h+20)continue;
+    mapCtx.beginPath();mapCtx.arc(s.x,s.y,3.5*DPR,0,7);
+    mapCtx.fillStyle='#fff';mapCtx.fill();
+    mapCtx.lineWidth=1.6*DPR;mapCtx.strokeStyle='#000';mapCtx.stroke();
+  }
   for(const st of stations){
+    // Loop course: start and finish markers overlap — show only Start until
+    // the race clock is running.
+    if(IS_LOOP&&st.type==='finish'&&clockState()==='idle')continue;
     const p=latLngAtKm(st.distance);if(!p)continue;
     const s=toScreen(p.lat,p.lng);
     if(s.x<-40||s.y<-40||s.x>w+40||s.y>h+40)continue;
@@ -712,16 +780,19 @@ function drawMap(){
       mapCtx.fillText(st.name,s.x+9*DPR,s.y+4*DPR);
     }
   }
-  // user marker at the visible-map center; the arrow rotates with heading
-  const hdg=headingDeg!=null?headingDeg:
-    (fix&&fix.coords.heading!=null&&fix.coords.speed>0.7?fix.coords.heading:0);
+  // user marker: nose-up in heading mode (the map rotates instead); in north
+  // mode the arrow itself rotates with the runner's heading.
+  const hdg=navMode==='heading'?rotation:
+    (headingDeg!=null?headingDeg:
+      (fix&&fix.coords.heading!=null&&fix.coords.speed>0.7?fix.coords.heading:0));
   mapCtx.save();
   mapCtx.translate(cx,cy);
-  mapCtx.rotate(hdg*Math.PI/180);
+  mapCtx.rotate((navMode==='heading'?0:hdg)*Math.PI/180);
   mapCtx.beginPath();
   mapCtx.moveTo(0,-fpx);mapCtx.lineTo(fpx*0.75,fpx*0.9);mapCtx.lineTo(0,fpx*0.45);mapCtx.lineTo(-fpx*0.75,fpx*0.9);
   mapCtx.closePath();
-  mapCtx.fillStyle=(fix&&(offM==null||offM<=OFF_ROUTE_M))?'#0057d9':'#8a949c';
+  mapCtx.fillStyle=wrongWay?'#c62828':
+    (fix&&(offM==null||offM<=OFF_ROUTE_M))?'#0057d9':'#8a949c';
   mapCtx.fill();
   mapCtx.lineWidth=2.5*DPR;mapCtx.strokeStyle='#fff';mapCtx.stroke();
   mapCtx.restore();
@@ -774,9 +845,13 @@ function drawProfile(){
     profCtx.lineWidth=1*DPR;profCtx.strokeStyle=day?'rgba(0,0,0,.28)':'rgba(255,255,255,.3)';
     profCtx.setLineDash([3*DPR,3*DPR]);profCtx.stroke();profCtx.setLineDash([]);
   }
-  // runner dot
+  // runner cursor: full-height vertical line + dot (Strava-style)
   if(alongM!=null){
     const x=X(Math.min(alongM,R.total)),y=Y(elevAtM(Math.min(alongM,R.total)));
+    profCtx.beginPath();profCtx.moveTo(x,T);profCtx.lineTo(x,h-B);
+    profCtx.lineWidth=1.5*DPR;
+    profCtx.strokeStyle=day?'rgba(0,0,0,.65)':'rgba(255,255,255,.8)';
+    profCtx.stroke();
     profCtx.beginPath();profCtx.arc(x,y,5.5*DPR,0,7);
     profCtx.fillStyle='#fff';profCtx.fill();
     profCtx.lineWidth=3*DPR;profCtx.strokeStyle='#ff6a1a';profCtx.stroke();
@@ -859,13 +934,69 @@ window.addEventListener('load',positionOverlays);
 setTimeout(positionOverlays,300);setTimeout(positionOverlays,1200);
 function updateLegpill(){
   const st=raceState(), lp=document.getElementById('legpill');
-  let txt='';
-  if(st.kind==='at_as')txt='AT '+st.station.name;
+  let txt='', color='#1d3f8f';
+  if(wrongWay){txt='↩ WRONG WAY';color='#c62828';}
+  else if(clockState()==='idle'&&startDistM!=null&&startDistM<=500&&startDistM>30){
+    // Walking to the start line among city streets: guiding to km 0 beats
+    // the off-route warning — pre-race you are off-route by definition.
+    txt='→ START · '+Math.round(startDistM)+' m';
+  }
+  else if(st.kind==='offroute'){txt='OFF ROUTE · '+Math.round(st.offM)+' m';color='#c62828';}
+  else if(st.kind==='at_as')txt='AT '+st.station.name;
   else if(st.kind==='in_leg')txt=legName(st.index-1);
-  else if(st.kind==='offroute')txt='OFF ROUTE · '+Math.round(st.offM)+' m';
   else if(stations.length>1)txt=legName(0);
   else txt=(D.general&&D.general.raceName)||'—';
   lp.textContent=txt;
+  lp.style.color=color;
+}
+
+/* ---------- AS break countdown (visible in map AND cards mode) ---------- */
+function updateBreakChip(){
+  const el=document.getElementById('breakchip');
+  const st=raceState(), cs=clockState();
+  if((cs==='running'||cs==='paused')
+     &&st.kind==='at_as'&&st.station.type!=='start'&&st.station.type!=='finish'
+     &&(st.station.breakTimeMinutes||0)>0){
+    if(!store.asArrival||store.asArrival.id!==st.station.id){
+      store.asArrival={id:st.station.id,t:Date.now()};save();
+    }
+  }else if(store.asArrival){
+    const stn=stations.find(s=>s.id===store.asArrival.id);
+    const gone=stn&&along!=null&&along>stn.distance+0.1;
+    const otherAs=st.kind==='at_as'&&st.station.id!==store.asArrival.id;
+    if(gone||otherAs){store.asArrival=null;save();}
+  }
+  const arr=store.asArrival;
+  const stn=arr?stations.find(s=>s.id===arr.id):null;
+  if(!stn){el.style.display='none';return;}
+  const left=(stn.breakTimeMinutes||0)*60-(Date.now()-arr.t)/1000;
+  el.style.display='block';
+  if(left>=0){el.classList.remove('over');el.textContent='⏱ '+stn.name+' · '+fmtHMS(left);}
+  else{el.classList.add('over');el.textContent='⏱ '+stn.name+' · +'+fmtHMS(-left)+' GO';}
+}
+
+/* ---------- keep the screen awake while navigating ----------
+   Navigating = race running/paused, or pre-start within 500 m of km 0
+   (walking to the start line). Released when idle/finished. */
+function navigating(){
+  const s=clockState();
+  if(s==='running'||s==='paused')return true;
+  return s==='idle'&&startDistM!=null&&startDistM<=500;
+}
+let wakeLock=null, wakeLockBusy=false;
+async function syncWakeLock(){
+  if(wakeLockBusy)return;
+  const want=navigating()&&!document.hidden;
+  try{
+    wakeLockBusy=true;
+    if(want&&!wakeLock&&('wakeLock'in navigator)){
+      wakeLock=await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release',()=>{wakeLock=null;});
+    }else if(!want&&wakeLock){
+      const wl=wakeLock;wakeLock=null;await wl.release();
+    }
+  }catch(e){wakeLock=null;}
+  finally{wakeLockBusy=false;}
 }
 
 /* ---------- race controls: Start → Pause → Resume + Finish ---------- */
@@ -886,24 +1017,31 @@ document.getElementById('controls').addEventListener('click',e=>{
   const now=Date.now();
   if(a==='start'){
     store.startedAt=now;store.pausedAt=null;store.pausedMs=0;store.finishedAt=null;
-    store.legMark=null;store.splitMark=null;
+    store.legMark=null;store.splitMark=null;store.asArrival=null;
+    wwMaxM=null;wrongWay=false;
     armCompass();
   }else if(a==='pause'){
     store.pausedAt=now;store.legMark=null;store.splitMark=null;
   }else if(a==='resume'){
     store.pausedMs=(store.pausedMs||0)+(now-(store.pausedAt||now));
     store.pausedAt=null;store.legMark=null;store.splitMark=null;
+    wwMaxM=null;wrongWay=false;
   }else if(a==='finish'){
     if(store.pausedAt){store.pausedMs=(store.pausedMs||0)+(now-store.pausedAt);store.pausedAt=null;}
     store.finishedAt=now;
   }else if(a==='reset'){
     delete store.startedAt;delete store.finishedAt;
     store.pausedAt=null;store.pausedMs=0;store.legMark=null;store.splitMark=null;
+    store.asArrival=null;wwMaxM=null;wrongWay=false;
   }
-  save();renderControls();updatePaceband();
+  save();renderControls();updatePaceband();syncWakeLock();
 });
 function mapLoop(){
   if(!mapOn)return;
+  if(navMode==='heading'){
+    rotTarget=headingDeg!=null?headingDeg:
+      (fix&&fix.coords.heading!=null&&fix.coords.speed>0.7?fix.coords.heading:rotTarget);
+  }
   drawMap();
   drawProfile();
   rafId=requestAnimationFrame(mapLoop);
@@ -933,8 +1071,11 @@ mapCv.addEventListener('pointermove',e=>{
     ptrs.set(e.pointerId,now);
     const tz=Math.max(TZ_MIN,Math.min(TZ_MAX,Math.round(mapZoom)));
     const scale=Math.pow(2,mapZoom-tz)*DPR;
-    // North-up map: the content follows the finger directly.
-    const wx=-dx/scale, wy=-dy/scale;
+    // Inverse of the draw transform (rot = -rotation): the content follows
+    // the finger, so the center moves by -R(+rotation)·(dx,dy)/scale.
+    const th=rotation*Math.PI/180;
+    const wx=-(dx*Math.cos(th)-dy*Math.sin(th))/scale;
+    const wy=-(dx*Math.sin(th)+dy*Math.cos(th))/scale;
     const c=mapCenter();
     const wc=mercWorld(c.lng,c.lat,tz);
     const nx=wc.x+wx, ny=wc.y+wy;
@@ -951,7 +1092,14 @@ mapCv.addEventListener('pointerup',releasePtr);
 mapCv.addEventListener('pointercancel',releasePtr);
 mapCv.addEventListener('wheel',e=>{e.preventDefault();
   mapZoom=Math.max(TZ_MIN-0.4,Math.min(TZ_MAX+0.9,mapZoom-e.deltaY*0.0018));},{passive:false});
-document.getElementById('center-btn').onclick=()=>{panCenter=null;panUntil=0;navNeedsDraw=true;};
+/* top-right button toggles the nav orientation (heading-up <-> north-up) */
+const modeBtn=document.getElementById('center-btn');
+function syncModeBtn(){modeBtn.textContent=navMode==='heading'?'▲':'N';}
+modeBtn.onclick=()=>{
+  navMode=navMode==='heading'?'north':'heading';
+  store.navMode=navMode;save();
+  syncModeBtn();navNeedsDraw=true;
+};
 
 /* compass heading */
 function onOrient(e){
@@ -1023,10 +1171,10 @@ function applyTheme(){
 
 /* ---------- boot ---------- */
 function render(){
-  updatePaceband();updateLegpill();
+  updatePaceband();updateLegpill();updateBreakChip();syncWakeLock();
   if(document.body.classList.contains('cards'))renderCards();
 }
-applyTheme();renderControls();updateLegpill();updatePaceband();
+applyTheme();renderControls();updateLegpill();updatePaceband();syncModeBtn();
 setView('map');positionOverlays();startGps();prefetchTiles();
 document.addEventListener('pointerdown',function once(){armCompass();document.removeEventListener('pointerdown',once);},{once:true});
 setInterval(()=>{applyTheme();render();},1000);
